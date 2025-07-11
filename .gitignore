@@ -73,6 +73,7 @@ celerybeat-schedule
 # virtualenv
 .venv/*
 venv/*
+.idea
 
 # docker local data
 docker/
