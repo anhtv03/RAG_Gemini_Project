@@ -6,139 +6,183 @@ from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmb
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
+from langchain_community.vectorstores import Chroma
+from langchain.chains.combine_documents import create_stuff_documents_chain
+from langchain_core.prompts import ChatPromptTemplate
 import easyocr
 import fitz  # PyMuPDF
 from PIL import Image
 import io
 import numpy as np
 
+# Load environment variables (like GOOGLE_API_KEY)
 load_dotenv()
 google_api_key = os.getenv("GOOGLE_API_KEY")
 os.environ["GOOGLE_API_KEY"] = google_api_key
 
-print("Đang khởi tạo ứng dụng RAG với LangChain và Gemini...")
-
-# 1. Get a document file path
+# --- 1. Get a document file path and define an OCR cache file path ---
 pdf_path = "data/data_document_root.pdf"
 ocr_cache_file = pdf_path + ".ocr_cache.json"
 
 if not os.path.exists(pdf_path):
-    print(f"Lỗi: Không tìm thấy tài liệu '{pdf_path}'. Vui lòng kiểm tra lại đường dẫn và tên file.")
-    exit()
+    raise FileNotFoundError(f"Lỗi: Không tìm thấy tài liệu '{pdf_path}'. Vui lòng kiểm tra lại đường dẫn và tên file.")
 
-def read_document_with_ocr_fallback(pdf_path):
+# --- Helper function to read and OCR PDF ---
+def _read_document_with_ocr_fallback(pdf_path: str) -> list[Document]:
+    """
+    Reads a PDF document, attempts to extract text with PyPDFLoader,
+    and falls back to EasyOCR for pages with insufficient content.
+    Caches OCR reader for efficiency.
+    """
     all_pages_langchain_documents = []
-    reader = None
+    reader = None  # EasyOCR Reader is initialized once
 
-    try:
-        print(f"Đang tải tài liệu từ '{pdf_path}' bằng PyPDFLoader...")
-        loader = PyPDFLoader(pdf_path)
-        pypdf_documents = loader.load()
-        print(f"Đã trích xuất văn bản từ {len(pypdf_documents)} trang bằng PyPDFLoader.")
+    doc = fitz.open(pdf_path)
+    total_pages_in_pdf = len(doc)
 
-        doc = fitz.open(pdf_path)
-        total_pages_in_pdf = len(doc)
+    # Load initial content from PyPDFLoader
+    loader = PyPDFLoader(pdf_path)
+    pypdf_documents = loader.load()
 
-        print(f"Tổng số trang trong PDF gốc: {total_pages_in_pdf}")
+    # Ensure pypdf_documents list matches total_pages_in_pdf
+    if len(pypdf_documents) < total_pages_in_pdf:
+        for _ in range(total_pages_in_pdf - len(pypdf_documents)):
+            pypdf_documents.append(Document(page_content="", metadata={}))
 
-        if len(pypdf_documents) < total_pages_in_pdf:
-            for _ in range(total_pages_in_pdf - len(pypdf_documents)):
-                pypdf_documents.append(Document(page_content="", metadata={}))
+    for i in range(total_pages_in_pdf):
+        page_content = pypdf_documents[i].page_content
+        page_metadata = pypdf_documents[i].metadata
 
-        for i in range(total_pages_in_pdf):
-            page_content = pypdf_documents[i].page_content
-            page_metadata = pypdf_documents[i].metadata
+        # Attempt OCR if PyPDFLoader yields too little content
+        if len(page_content.strip()) < 50:
+            if reader is None:
+                reader = easyocr.Reader(['en']) # Initialize EasyOCR reader
 
-            if len(page_content.strip()) < 50:
-                print(f"Trang {i + 1} có ít nội dung, đang thử OCR...")
-                if reader is None:
-                    print("Đang khởi tạo EasyOCR (lần đầu sẽ tải model)...")
-                    reader = easyocr.Reader(['en'])
+            page = doc[i]
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            img_data = pix.tobytes("png")
 
-                page = doc[i]
-                pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-                img_data = pix.tobytes("png")
+            image = Image.open(io.BytesIO(img_data))
+            image_np = np.array(image)
 
-                image = Image.open(io.BytesIO(img_data))
-                image_np = np.array(image)
-
-                try:
-                    ocr_result = reader.readtext(image_np)
-                    ocr_text = ' '.join([item[1] for item in ocr_result if item[1].strip()])
-                    if ocr_text:
-                        print(f"Đã OCR trang {i + 1} thành công ({len(ocr_text)} ký tự).")
-                        if len(page_content.strip()) < 50:
-                            pypdf_documents[i].page_content = ocr_text
-                        else:
-                            pypdf_documents[i].page_content = page_content + "\n" + ocr_text
+            try:
+                ocr_result = reader.readtext(image_np)
+                ocr_text = ' '.join([item[1] for item in ocr_result if item[1].strip()])
+                if ocr_text:
+                    if len(page_content.strip()) < 50:
+                        pypdf_documents[i].page_content = ocr_text
                     else:
-                        print(f"OCR trang {i + 1} không tìm thấy văn bản.")
-                except Exception as ocr_e:
-                    print(f"Lỗi khi OCR trang {i + 1}: {ocr_e}")
-            else:
-                print(f"Trang {i + 1} có đủ nội dung từ PyPDFLoader.")
+                        pypdf_documents[i].page_content = page_content + "\n" + ocr_text
+            except Exception as ocr_e:
+                print(f"Lỗi khi OCR trang {i + 1}: {ocr_e}") # Keep this for rare OCR errors
 
-            if 'source' not in page_metadata:
-                page_metadata['source'] = pdf_path
-            if 'page' not in page_metadata:
-                page_metadata['page'] = i
+        # Ensure metadata is present for source and page number
+        if 'source' not in page_metadata:
+            page_metadata['source'] = pdf_path
+        if 'page' not in page_metadata:
+            page_metadata['page'] = i
 
-            all_pages_langchain_documents.append(
-                Document(page_content=pypdf_documents[i].page_content, metadata=page_metadata))
+        all_pages_langchain_documents.append(
+            Document(page_content=pypdf_documents[i].page_content, metadata=page_metadata))
 
-        doc.close()
-        return all_pages_langchain_documents
+    doc.close()
+    return all_pages_langchain_documents
 
-    except Exception as e:
-        print(f"Lỗi khi tải hoặc xử lý tài liệu: {e}")
-        exit()
-
-
-# --- 2. Reading Document (Logic kiểm tra cache) ---
+# --- 2. Reading Document (with caching logic) ---
 documents = []
 if os.path.exists(ocr_cache_file):
-    print(f"Đang tải nội dung tài liệu từ file cache '{ocr_cache_file}'...")
     try:
         with open(ocr_cache_file, "r", encoding="utf-8") as f:
             cached_data = json.load(f)
-            # Chuyển dữ liệu từ JSON thành các đối tượng Document của LangChain
             documents = [Document(page_content=item['page_content'], metadata=item['metadata'])
                          for item in cached_data]
-        print(f"Đã tải {len(documents)} trang từ file cache.")
     except Exception as e:
-        print(f"Lỗi khi tải file cache: {e}. Đang tiến hành OCR lại.")
-        documents = read_document_with_ocr_fallback(pdf_path)
-        # Lưu kết quả OCR vào cache
+        # Fallback to OCR if cache loading fails
+        print(f"Lỗi khi tải file cache '{ocr_cache_file}': {e}. Đang tiến hành OCR lại.")
+        documents = _read_document_with_ocr_fallback(pdf_path)
+        # Save new OCR results to the cache
         cached_data = [{'page_content': doc.page_content, 'metadata': doc.metadata} for doc in documents]
         with open(ocr_cache_file, "w", encoding="utf-8") as f:
             json.dump(cached_data, f, ensure_ascii=False, indent=4)
-        print(f"Đã lưu {len(documents)} trang vào file cache '{ocr_cache_file}'.")
 else:
-    print("File cache không tồn tại. Đang tiến hành đọc và OCR tài liệu...")
-    documents = read_document_with_ocr_fallback(pdf_path)
-    # Lưu kết quả OCR vào cache sau khi xử lý
+    documents = _read_document_with_ocr_fallback(pdf_path)
+    # Save OCR results to a cache after processing
     cached_data = [{'page_content': doc.page_content, 'metadata': doc.metadata} for doc in documents]
     with open(ocr_cache_file, "w", encoding="utf-8") as f:
         json.dump(cached_data, f, ensure_ascii=False, indent=4)
-    print(f"Đã lưu {len(documents)} trang vào file cache '{ocr_cache_file}'.")
 
-print(f"Đã có tổng cộng {len(documents)} trang tài liệu sau khi đọc và OCR (hoặc tải từ cache).")
 
 # --- 3. Chunk Document ---
-print("Đang chia nhỏ tài liệu thành các đoạn...")
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=1000,
     chunk_overlap=200,
     length_function=len,
     add_start_index=True,
 )
-chunks = text_splitter.split_documents(documents)
-print(f"Đã chia {len(documents)} trang thành {len(chunks)} đoạn tài liệu.")
-print(f"Tổng số đoạn tài liệu đã tạo: {len(chunks)}.")
+splits = text_splitter.split_documents(documents)
+print(f"Đã hoàn tất tiền xử lý tài liệu. Tổng số đoạn tài liệu đã tạo: {len(splits)}.")
 
-# Bạn có thể in một vài đoạn mẫu để kiểm tra
-if chunks:
-    print("\nMột số đoạn mẫu:")
-    doc = chunks[10]
-    print(doc.page_content)
-    print(f"Nguồn: {doc.metadata}")
+# 4. Create Embeddings and save to Vector Store (ChromaDB)
+print("Đang tạo embeddings và lưu vào Vector Store (ChromaDB)...")
+embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
+
+vectorstore = Chroma.from_documents(
+    documents=splits,
+    embedding=embeddings,
+    persist_directory="./chroma_db" # Đường dẫn lưu trữ database
+)
+print("Đã tạo và lưu Vector Store thành công.")
+
+# 5. Initialize Gemini's Large Language Model (LLM)
+print("Đang khởi tạo mô hình Gemini...")
+# llm = ChatGoogleGenerativeAI(model="models/gemini-1.5-pro")
+llm = ChatGoogleGenerativeAI(model="models/gemini-1.5-flash")
+
+# 6. Setup Retriever
+print("Đang thiết lập Retriever...")
+retriever = vectorstore.as_retriever(search_kwargs={"k": 3}) # Lấy 3 đoạn tài liệu liên quan nhất
+
+# 7. Building the RAG Chain (Retrieval Chain)
+print("Đang xây dựng chuỗi RAG...")
+# Định nghĩa prompt cho Gemini
+prompt = ChatPromptTemplate.from_messages([
+    ("system", "Bạn là một trợ lý thông minh. Hãy trả lời câu hỏi dựa trên ngữ cảnh được cung cấp. "
+               "Nếu bạn không biết câu trả lời từ ngữ cảnh, hãy nói rằng bạn không có thông tin."),
+    ("user", "Ngữ cảnh:\n{context}\n\nCâu hỏi: {input}")
+])
+
+# Tạo chain để kết hợp tài liệu được truy xuất với prompt và LLM
+document_chain = create_stuff_documents_chain(llm, prompt)
+
+# Tạo chain tổng thể bao gồm truy xuất và tạo câu trả lời
+retrieval_chain = create_retrieval_chain(retriever, document_chain)
+print("Chuỗi RAG đã sẵn sàng.")
+
+# 8. Question and answer loop
+print("\n--- Sẵn sàng nhận câu hỏi của bạn! Gõ 'thoat' để thoát ---")
+while True:
+    user_question = input("Bạn hỏi: ")
+    if user_question.lower() == "thoat":
+        print("Cảm ơn bạn đã sử dụng. Tạm biệt!")
+        break
+
+    try:
+        print("Đang xử lý câu hỏi của bạn...")
+        # Gọi chuỗi RAG để nhận câu trả lời
+        response = retrieval_chain.invoke({"input": user_question})
+        print("\nGemini trả lời:")
+        print(response["answer"])
+        print("-" * 50)
+    except Exception as e:
+        print(f"Đã xảy ra lỗi khi xử lý câu hỏi: {e}")
+        print("Vui lòng kiểm tra lại API Key và kết nối internet.")
+
+
+
+
+
+
+
+
+
+
