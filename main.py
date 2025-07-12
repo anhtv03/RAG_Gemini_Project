@@ -39,10 +39,28 @@ def clean_text(text):
     text = re.sub(r'\n{2,}', '\n', text).strip()  # Normalize multiple newlines
     return text
 
+def filter_header_footer(ocr_text, previous_text=None):
+    """Filter out header and footer based on keywords and previous page content."""
+    lines = ocr_text.split('\n')
+    if len(lines) > 2:
+        if any("Section" in line or "Copyright" in line for line in lines[:2]):
+            lines = lines[2:]
+        if any("Copyright" in line for line in lines[-2:]):
+            lines = lines[:-2]
+    if previous_text:
+        common_start = os.path.commonprefix([ocr_text, previous_text])
+        if len(common_start) > 20:
+            lines = lines[len(common_start.split('\n')):]
+        common_end = os.path.commonprefix([ocr_text[::-1], previous_text[::-1]])
+        if len(common_end) > 10:
+            lines = lines[:-len(common_end.split('\n')[::-1])]
+    return '\n'.join(lines)
+
 def _read_document_with_ocr_fallback(pdf_path: str) -> list[Document]:
     """Reads a PDF document, extracts text with PyPDFLoader, and uses OCR for low-content pages."""
     all_pages_langchain_documents = []
-    reader = easyocr.Reader(['en', 'vi'])  # Support English and Vietnamese
+    reader = easyocr.Reader(['en', 'vi'])
+    previous_text = None
 
     doc = fitz.open(pdf_path)
     total_pages_in_pdf = len(doc)
@@ -56,16 +74,18 @@ def _read_document_with_ocr_fallback(pdf_path: str) -> list[Document]:
 
     for i in range(total_pages_in_pdf):
         print(f"Processing page {i + 1}/{total_pages_in_pdf}")
+
+        page = doc[i]
+        page_height = page.rect.height
+        clip = fitz.Rect(0, 100, page.rect.width, page_height - 100)
+        pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip)
+        img_data = pix.tobytes("png")
+        image = Image.open(io.BytesIO(img_data))
+        image_np = np.array(image)
+
         page_content = pypdf_documents[i].page_content
         page_metadata = pypdf_documents[i].metadata
-
-        if len(page_content.strip()) < 50:  # Threshold for OCR fallback
-            page = doc[i]
-            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
-            img_data = pix.tobytes("png")
-            image = Image.open(io.BytesIO(img_data))
-            image_np = np.array(image)
-
+        if len(page_content.strip()) < 50:
             try:
                 ocr_result = reader.readtext(image_np, detail=0)
                 ocr_text = ' '.join(ocr_result)
@@ -74,6 +94,8 @@ def _read_document_with_ocr_fallback(pdf_path: str) -> list[Document]:
             except Exception as ocr_e:
                 print(f"OCR error on page {i + 1}: {ocr_e}")
 
+        page_content = filter_header_footer(page_content, previous_text)
+        previous_text = page_content
         page_content = clean_text(page_content)
         page_metadata.update({'source': pdf_path, 'page': i, 'page_label': str(i + 1)})
 
