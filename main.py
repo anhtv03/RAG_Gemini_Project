@@ -14,6 +14,7 @@ import fitz  # PyMuPDF
 from PIL import Image
 import io
 import numpy as np
+import re
 
 # Load environment variables (like GOOGLE_API_KEY)
 load_dotenv()
@@ -21,7 +22,7 @@ google_api_key = os.getenv("GOOGLE_API_KEY")
 os.environ["GOOGLE_API_KEY"] = google_api_key
 
 # --- 1. Get a document file path and define an OCR cache file path ---
-pdf_path = "data/data_document_root.pdf"
+pdf_path = "data/trang-8-58.pdf"
 ocr_cache_file = pdf_path + ".ocr_cache.json"
 
 if not os.path.exists(pdf_path):
@@ -32,7 +33,7 @@ def _read_document_with_ocr_fallback(pdf_path: str) -> list[Document]:
     """
     Reads a PDF document, attempts to extract text with PyPDFLoader,
     and falls back to EasyOCR for pages with insufficient content.
-    Caches OCR reader for efficiency.
+    Caches OCR reader for efficiency and preprocesses text.
     """
     all_pages_langchain_documents = []
     reader = None  # EasyOCR Reader is initialized once
@@ -50,13 +51,14 @@ def _read_document_with_ocr_fallback(pdf_path: str) -> list[Document]:
             pypdf_documents.append(Document(page_content="", metadata={}))
 
     for i in range(total_pages_in_pdf):
+        print(f"Đang xử lý trang {i + 1}/{total_pages_in_pdf}")
         page_content = pypdf_documents[i].page_content
         page_metadata = pypdf_documents[i].metadata
 
         # Attempt OCR if PyPDFLoader yields too little content
         if len(page_content.strip()) < 50:
             if reader is None:
-                reader = easyocr.Reader(['en']) # Initialize EasyOCR reader
+                reader = easyocr.Reader(['en'])  # Initialize EasyOCR reader
 
             page = doc[i]
             pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
@@ -70,11 +72,16 @@ def _read_document_with_ocr_fallback(pdf_path: str) -> list[Document]:
                 ocr_text = ' '.join([item[1] for item in ocr_result if item[1].strip()])
                 if ocr_text:
                     if len(page_content.strip()) < 50:
-                        pypdf_documents[i].page_content = ocr_text
+                        page_content = ocr_text
                     else:
-                        pypdf_documents[i].page_content = page_content + "\n" + ocr_text
+                        page_content = page_content + "\n" + ocr_text
             except Exception as ocr_e:
-                print(f"Lỗi khi OCR trang {i + 1}: {ocr_e}") # Keep this for rare OCR errors
+                print(f"Lỗi khi OCR trang {i + 1}: {ocr_e}")
+
+        # Preprocess text: remove extra whitespace and handle \n intelligently
+        page_content = re.sub(r'\s+', ' ', page_content.strip())  # Replace multiple whitespace with single space
+        page_content = re.sub(r'(?<![\.\!\?])\n', ' ', page_content)  # Remove \n not preceded by . ! ?
+        page_content = re.sub(r'\n{2,}', '\n', page_content).strip()  # Normalize multiple newlines to single
 
         # Ensure metadata is present for source and page number
         if 'source' not in page_metadata:
@@ -83,7 +90,7 @@ def _read_document_with_ocr_fallback(pdf_path: str) -> list[Document]:
             page_metadata['page'] = i
 
         all_pages_langchain_documents.append(
-            Document(page_content=pypdf_documents[i].page_content, metadata=page_metadata))
+            Document(page_content=page_content, metadata=page_metadata))
 
     doc.close()
     return all_pages_langchain_documents
@@ -97,20 +104,16 @@ if os.path.exists(ocr_cache_file):
             documents = [Document(page_content=item['page_content'], metadata=item['metadata'])
                          for item in cached_data]
     except Exception as e:
-        # Fallback to OCR if cache loading fails
         print(f"Lỗi khi tải file cache '{ocr_cache_file}': {e}. Đang tiến hành OCR lại.")
         documents = _read_document_with_ocr_fallback(pdf_path)
-        # Save new OCR results to the cache
         cached_data = [{'page_content': doc.page_content, 'metadata': doc.metadata} for doc in documents]
         with open(ocr_cache_file, "w", encoding="utf-8") as f:
             json.dump(cached_data, f, ensure_ascii=False, indent=4)
 else:
     documents = _read_document_with_ocr_fallback(pdf_path)
-    # Save OCR results to a cache after processing
     cached_data = [{'page_content': doc.page_content, 'metadata': doc.metadata} for doc in documents]
     with open(ocr_cache_file, "w", encoding="utf-8") as f:
         json.dump(cached_data, f, ensure_ascii=False, indent=4)
-
 
 # --- 3. Chunk Document ---
 text_splitter = RecursiveCharacterTextSplitter(
@@ -129,7 +132,7 @@ embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
 vectorstore = Chroma.from_documents(
     documents=splits,
     embedding=embeddings,
-    persist_directory="./chroma_db" # Đường dẫn lưu trữ database
+    persist_directory="./chroma_db"  # Đường dẫn lưu trữ database
 )
 print("Đã tạo và lưu Vector Store thành công.")
 
@@ -140,7 +143,7 @@ llm = ChatGoogleGenerativeAI(model="models/gemini-1.5-flash")
 
 # 6. Setup Retriever
 print("Đang thiết lập Retriever...")
-retriever = vectorstore.as_retriever(search_kwargs={"k": 3}) # Lấy 3 đoạn tài liệu liên quan nhất
+retriever = vectorstore.as_retriever(search_kwargs={"k": 3})  # Lấy 3 đoạn tài liệu liên quan nhất
 
 # 7. Building the RAG Chain (Retrieval Chain)
 print("Đang xây dựng chuỗi RAG...")
@@ -168,7 +171,6 @@ while True:
 
     try:
         print("Đang xử lý câu hỏi của bạn...")
-        # Gọi chuỗi RAG để nhận câu trả lời
         response = retrieval_chain.invoke({"input": user_question})
         print("\nGemini trả lời:")
         print(response["answer"])
@@ -176,13 +178,3 @@ while True:
     except Exception as e:
         print(f"Đã xảy ra lỗi khi xử lý câu hỏi: {e}")
         print("Vui lòng kiểm tra lại API Key và kết nối internet.")
-
-
-
-
-
-
-
-
-
-
