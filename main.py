@@ -33,6 +33,7 @@ if not os.path.exists(pdf_path):
 # -------------------------------------- Helper functions -------------------------------------------
 def clean_text(text):
     """Clean text by removing noise and normalizing whitespace."""
+    text = re.sub(r'(\w+)-\s*(\w+)', r'\1\2', text) # Combine the split words.
     text = re.sub(r'[^\w\s\.\!\?]', '', text)  # Remove special characters
     text = re.sub(r'\s+', ' ', text.strip())   # Normalize whitespace
     text = re.sub(r'(?<![\.\!\?])\n', ' ', text)  # Remove \n not after . ! ?
@@ -43,7 +44,7 @@ def filter_header_footer(ocr_text, previous_text=None):
     """Filter out header and footer based on keywords and previous page content."""
     lines = ocr_text.split('\n')
     if len(lines) > 2:
-        if any("Section" in line or "Copyright" in line for line in lines[:2]):
+        if any("Section" in line or "Chapter" in line or "Copyright" in line for line in lines[:2]):
             lines = lines[2:]
         if any("Copyright" in line for line in lines[-2:]):
             lines = lines[:-2]
@@ -57,7 +58,7 @@ def filter_header_footer(ocr_text, previous_text=None):
     return '\n'.join(lines)
 
 def _read_document_with_ocr_fallback(pdf_path: str) -> list[Document]:
-    """Reads a PDF document, extracts text with PyPDFLoader, and uses OCR for low-content pages."""
+    """Reads a PDF document, extracts text with PyPDFLoader, and uses OCR for pages with potential image content."""
     all_pages_langchain_documents = []
     reader = easyocr.Reader(['en', 'vi'])
     previous_text = None
@@ -77,7 +78,7 @@ def _read_document_with_ocr_fallback(pdf_path: str) -> list[Document]:
 
         page = doc[i]
         page_height = page.rect.height
-        clip = fitz.Rect(0, 100, page.rect.width, page_height - 100)
+        clip = fitz.Rect(0, 100, page.rect.width, page_height - 100)  # remove header/footer
         pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip)
         img_data = pix.tobytes("png")
         image = Image.open(io.BytesIO(img_data))
@@ -85,14 +86,15 @@ def _read_document_with_ocr_fallback(pdf_path: str) -> list[Document]:
 
         page_content = pypdf_documents[i].page_content
         page_metadata = pypdf_documents[i].metadata
-        if len(page_content.strip()) < 50:
-            try:
-                ocr_result = reader.readtext(image_np, detail=0)
-                ocr_text = ' '.join(ocr_result)
-                if ocr_text:
-                    page_content = ocr_text if len(page_content.strip()) < 50 else page_content + "\n" + ocr_text
-            except Exception as ocr_e:
-                print(f"OCR error on page {i + 1}: {ocr_e}")
+
+        # Perform OCR to check image content
+        try:
+            ocr_result = reader.readtext(image_np, detail=0)
+            ocr_text = ' '.join(ocr_result).strip()
+            if ocr_text and len(ocr_text) > 20:
+                page_content = page_content + "\n" + ocr_text if page_content else ocr_text
+        except Exception as ocr_e:
+            print(f"OCR error on page {i + 1}: {ocr_e}")
 
         page_content = filter_header_footer(page_content, previous_text)
         previous_text = page_content
@@ -127,6 +129,12 @@ else:
         json.dump(cached_data, f, ensure_ascii=False, indent=4)
     print(f"Created cache with {len(documents)} pages.")
 
+#lấy data từ BD lên, kiểm tra xem có hay không
+#nếu có thì thực hiện lấy data lên
+#nếu không thì:
+#documents = _read_document_with_ocr_fallback(pdf_path)
+#commit documents vào DB
+
 # --- 3. Chunk Document ---
 text_splitter = RecursiveCharacterTextSplitter(
     chunk_size=1000,
@@ -154,13 +162,22 @@ llm = ChatGoogleGenerativeAI(model="models/gemini-1.5-flash")
 # --- 6. Setup Retriever ---
 print("Setting up Retriever...")
 retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+#code using Databse
+# retriever = PGVector.from_existing_index(
+#     connection_string="postgresql://your_user:your_password@localhost:5432/your_db",
+#     embedding=GoogleGenerativeAIEmbeddings(model="models/embedding-001"), #model embedding gemini
+#     collection_name="material_content", #ten bang trong db
+#     distance_strategy="cosine",
+#     pre_delete_collection=False
+# ).as_retriever(search_kwargs={"k": 5})
 
 # --- 7. Building the RAG Chain ---
 print("Building RAG chain...")
 prompt = ChatPromptTemplate.from_messages([
-    ("system", "You are an intelligent assistant. Answer the question based on the provided context. "
-               "If the context is unclear or contains errors, try to infer from valid parts. "
-               "If no relevant information is available, say 'I don’t have sufficient information.'"),
+    ("system", "You are an intelligent assistant. Answer the question solely based on the provided context. "
+               "Do not use external knowledge unless explicitly allowed. "
+               "If the context is unclear, contains errors, or lacks relevant information, try to infer from valid parts. "
+               "If no relevant information is available or the context is empty, say 'I don’t have sufficient information.'"),
     ("user", "Context:\n{context}\n\nQuestion: {input}")
 ])
 document_chain = create_stuff_documents_chain(llm, prompt)
